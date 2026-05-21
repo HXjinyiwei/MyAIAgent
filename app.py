@@ -5,6 +5,7 @@ from src.tools.weather import process_weather_for_briefing, process_weather_comp
 from src.tools.news import process_news_for_briefing  
 from src.tools.calendar import process_calendar_for_briefing, process_schedule_management
 from src.tools.quote import generate_daily_quote
+from src.utils.api_client import APIClient
 
 # 页面配置
 st.set_page_config(
@@ -19,10 +20,33 @@ st.title("📋 个人每日智能简报 AI Agent")
 @st.cache_resource
 def get_agent():
     agent = AgentCore()
+    api_client = APIClient()
+    
+    # 注册工具，传递API提供商配置
+    def weather_tool(city):
+        return process_weather_for_briefing(
+            city, 
+            weather_provider=api_client.weather_provider,
+            weather_api_key=api_client.juhe_weather_api_key if api_client.weather_provider == 'juhe' else api_client.weather_api_key
+        )
+    
+    def weather_comparison_tool(cities):
+        return process_weather_comparison(
+            cities,
+            weather_provider=api_client.weather_provider,
+            weather_api_key=api_client.juhe_weather_api_key if api_client.weather_provider == 'juhe' else api_client.weather_api_key
+        )
+    
+    def news_tool(interests, random_mode=False):
+        return process_news_for_briefing(
+            interests,
+            random_mode=random_mode
+        )
+    
     # 注册工具
-    agent.register_tool('weather', process_weather_for_briefing)
-    agent.register_tool('weather_comparison', process_weather_comparison)
-    agent.register_tool('news', process_news_for_briefing)
+    agent.register_tool('weather', weather_tool)
+    agent.register_tool('weather_comparison', weather_comparison_tool)
+    agent.register_tool('news', news_tool)
     agent.register_tool('calendar', process_calendar_for_briefing)
     agent.register_tool('schedule_manage', process_schedule_management)
     agent.register_tool('quote', generate_daily_quote)
@@ -49,27 +73,22 @@ st.sidebar.header("使用说明")
 st.sidebar.markdown("""
 ### 📋 基本
 - `生成今天的简报` — 生成完整日报
-- `我现在有哪些设置？` — 查询配置
+- `我在[城市名]` — 设置所在城市
+- `关注[领域1]、[领域2]` — 设置兴趣领域
 
-### ☀️ 天气
-- `我在广州` — 设置所在城市
-- `中国广州和深圳天气对比` — 多城市对比表格
+### 🌤️ 天气
+- `[城市名]天气` — 查询指定城市天气
+- `[城市1]和[城市2]天气对比` — 对比两个城市天气
 
-### 📰 新闻
-- `关注AI、半导体` — 设置兴趣领域
-- `今天不要AI新闻` — 临时排除（仅当天）
-- `今天随机推送` — 随机探索
+### 🗓️ 日程
+- `今天下午3点有个会议` — 添加日程
+- `今天有哪些安排` — 查看今日日程
 
-### 📅 日程
-- `今天下午3点评审会` — 添加事项
-- `把下午的会取消` — 删除事项
-- `我今天有哪些事？` — 查询日程
-- `接下来一周每天10点学习` — 重复日程
+### 🔄 配置管理
+- 支持自然语言配置修改
+- 所有配置自动持久化保存
 
-### ⚙️ 其他
-- `我是Java开发工程师` — 设置职业
-- `以后不要每日寄语了` — 开关控制
-- 天气+日程冲突 → 自动触发智能提醒
+> 💡 **提示**：首次使用请先设置城市和兴趣领域！
 """)
 
 st.sidebar.header("项目状态")

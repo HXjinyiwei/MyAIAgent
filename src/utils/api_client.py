@@ -2,8 +2,11 @@ import os
 import asyncio
 import aiohttp
 import requests
+import sqlite3
 from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from .config import ConfigManager
 
 # 加载环境变量
 load_dotenv()
@@ -12,15 +15,26 @@ class APIClient:
     """API客户端管理器"""
     
     def __init__(self):
+        self.config_manager = ConfigManager()
         self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY')
         self.weather_api_key = os.getenv('WEATHER_API_KEY')
         self.news_api_key = os.getenv('NEWS_API_KEY')
-        self.weather_provider = os.getenv('WEATHER_API_PROVIDER', 'openweathermap')
+        self.juhe_weather_api_key = os.getenv('JUHE_WEATHER_API_KEY') or os.getenv('WEATHER_API_KEY')
+        self.juhe_news_api_key = os.getenv('JUHE_NEWS_API_KEY') or os.getenv('NEWS_API_KEY')
+        self.weather_provider = os.getenv('WEATHER_PROVIDER', 'openweathermap')
+        self.news_provider = os.getenv('NEWS_PROVIDER', 'newsapi')
+        
+        # 从配置文件获取API设置
+        api_config = self.config_manager.get_api_config()
+        self.timeout = api_config.get('timeout', 30)
+        self.retry_count = api_config.get('retry_count', 3)
         
         # API端点配置
         self.deepseek_base_url = "https://api.deepseek.com"
         self.openweathermap_base_url = "https://api.openweathermap.org/data/2.5"
         self.newsapi_base_url = "https://newsapi.org/v2"
+        self.juhe_weather_base_url = "https://apis.juhe.cn/simpleWeather/query"
+        self.juhe_news_base_url = "https://v.juhe.cn/toutiao/index"
 
         self._requests_session = requests.Session()
     
@@ -42,7 +56,7 @@ class APIClient:
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data, timeout=30) as response:
+                async with session.post(url, headers=headers, json=data, timeout=self.timeout) as response:
                     if response.status == 200:
                         result = await response.json()
                         return result['choices'][0]['message']['content'].strip()
@@ -54,66 +68,181 @@ class APIClient:
             print(f"DeepSeek API call failed: {e}")
             return None
     
-    async def _geocode_city(self, city: str) -> Optional[Dict]:
-        CITY_COORDS = {
-            '重庆': (29.431586, 106.912251),
-            '北京': (39.9042, 116.4074),
-            '上海': (31.2304, 121.4737),
-            '天津': (39.3434, 117.3616),
-            '成都': (30.5728, 104.0668),
-            '西安': (34.3416, 108.9398),
-            '香港': (22.3193, 114.1694),
-        }
-        if city in CITY_COORDS:
-            return {'lat': CITY_COORDS[city][0], 'lon': CITY_COORDS[city][1], 'name': city}
+    def _get_cache_key(self, service_type: str, **kwargs) -> str:
+        """生成缓存键"""
+        if service_type == 'weather':
+            city = kwargs.get('city', '')
+            return f"weather_{self.weather_provider}_{city}_{datetime.now().strftime('%Y-%m-%d')}"
+        elif service_type == 'news':
+            interests = kwargs.get('interests', [])
+            random_mode = kwargs.get('random_mode', False)
+            interest_str = '_'.join(sorted(interests)) if interests else 'all'
+            mode_str = 'random' if random_mode else 'normal'
+            return f"news_{self.news_provider}_{interest_str}_{mode_str}_{datetime.now().strftime('%Y-%m-%d')}"
+        return None
+    
+    def _get_from_cache(self, cache_key: str) -> Optional[Dict]:
+        """从缓存获取数据"""
+        try:
+            from ..memory import MemoryManager
+            memory_manager = MemoryManager()
+            
+            conn = sqlite3.connect(memory_manager.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT cache_value FROM cache_data 
+                WHERE cache_key = ? AND expires_at > ?
+            ''', (cache_key, datetime.now()))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                import json
+                return json.loads(result[0])
+        except Exception as e:
+            print(f"Cache read failed: {e}")
+        return None
+    
+    def _save_to_cache(self, cache_key: str, data: Dict, expire_minutes: int = 30):
+        """保存数据到缓存"""
+        try:
+            from ..memory import MemoryManager
+            memory_manager = MemoryManager()
+            
+            expires_at = datetime.now() + timedelta(minutes=expire_minutes)
+            import json
+            cache_value = json.dumps(data, ensure_ascii=False, default=str)
+            
+            conn = sqlite3.connect(memory_manager.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO cache_data (cache_key, cache_value, expires_at)
+                VALUES (?, ?, ?)
+            ''', (cache_key, cache_value, expires_at))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Cache save failed: {e}")
+    
+    async def _get_openweathermap_data(self, city: str) -> Optional[Dict]:
+        # 检查缓存
+        cache_key = self._get_cache_key('weather', city=city)
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
+        if not self.weather_api_key:
+            return None
 
-        geo_url = "http://api.openweathermap.org/geo/1.0/direct"
-        params = {'q': city, 'limit': 1, 'appid': self.weather_api_key}
+        geo = await self._geocode_city(city)
+        if not geo:
+            return None
+
+        url = f"{self.openweathermap_base_url}/weather"
+        params = {
+            'lat': geo['lat'],
+            'lon': geo['lon'],
+            'appid': self.weather_api_key,
+            'units': 'metric',
+            'lang': 'zh_cn'
+        }
+
         try:
             loop = asyncio.get_running_loop()
-            resp = await loop.run_in_executor(None, lambda: self._requests_session.get(geo_url, params=params, timeout=10))
+            resp = await loop.run_in_executor(None, lambda: self._requests_session.get(url, params=params, timeout=self.timeout))
             if resp.status_code == 200:
-                data = resp.json()
-                if data:
-                    return {'lat': data[0]['lat'], 'lon': data[0]['lon'], 'name': data[0].get('local_names', {}).get('zh', data[0]['name'])}
-                print(f"Geocode: city '{city}' not found")
-                return None
-            print(f"Geocode API error: {resp.status_code} - {resp.text}")
+                result = resp.json()
+                result['name'] = city
+                # 保存到缓存（30分钟）
+                self._save_to_cache(cache_key, result, expire_minutes=30)
+                return result
+            print(f"Weather API error: {resp.status_code} - {resp.text}")
             return None
         except Exception as e:
-            print(f"Geocode API call failed: {e}")
+            print(f"Weather API call failed: {e}")
+            return None
+    
+    async def _get_juhe_weather_data(self, city: str) -> Optional[Dict]:
+        # 检查缓存
+        cache_key = self._get_cache_key('weather', city=city)
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
+        if not self.juhe_weather_api_key:
+            return None
+        
+        import urllib.parse
+        encoded_city = urllib.parse.quote(city, encoding='utf-8')
+        url = f"{self.juhe_weather_base_url}?key={self.juhe_weather_api_key}&city={encoded_city}"
+        
+        try:
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: self._requests_session.get(url, timeout=self.timeout))
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get('error_code') == 0:
+                    juhe_data = result.get('result', {})
+                    if not juhe_data:
+                        return None
+                    
+                    realtime = juhe_data.get('realtime', {})
+                    future = juhe_data.get('future', [])
+                    
+                    # 构建标准化的天气数据结构
+                    standardized_data = {
+                        'name': juhe_data.get('city', city),
+                        'weather': [{'description': realtime.get('info', '未知')}],
+                        'main': {
+                            'temp': float(realtime.get('temperature', 0)) if realtime.get('temperature') else 0,
+                            'feels_like': float(realtime.get('temperature', 0)) if realtime.get('temperature') else 0,
+                            'humidity': int(realtime.get('humidity', 0)) if realtime.get('humidity') else 0,
+                            'pressure': 1013  # juhe不提供气压，使用标准值
+                        },
+                        'wind': {
+                            'speed': 0  # juhe不提供风速，暂时设为0
+                        },
+                        'visibility': 10000,  # juhe不提供能见度，使用默认值
+                        'clouds': {'all': 0}  # juhe不提供云量，设为0
+                    }
+                    
+                    # 如果有未来天气数据，取第一天作为当前温度范围
+                    if future:
+                        day_data = future[0]
+                        temp_str = day_data.get('temperature', '0/0℃')
+                        # 解析温度字符串如 "1/7℃"
+                        if '℃' in temp_str:
+                            temp_parts = temp_str.replace('℃', '').split('/')
+                            if len(temp_parts) == 2:
+                                try:
+                                    temp_min = float(temp_parts[0])
+                                    temp_max = float(temp_parts[1])
+                                    standardized_data['main']['temp_min'] = temp_min
+                                    standardized_data['main']['temp_max'] = temp_max
+                                    # 如果没有实时温度，使用平均温度
+                                    if standardized_data['main']['temp'] == 0:
+                                        standardized_data['main']['temp'] = (temp_min + temp_max) / 2
+                                except ValueError:
+                                    pass
+                    
+                    # 保存到缓存（30分钟）
+                    self._save_to_cache(cache_key, standardized_data, expire_minutes=30)
+                    return standardized_data
+            return None
+        except Exception as e:
+            print(f"Juhe Weather API call failed: {e}")
             return None
 
     async def get_weather_data(self, city: str) -> Optional[Dict]:
-        if not self.weather_api_key:
-            raise ValueError("Weather API key not configured")
-
+        """获取天气数据 - 支持多提供商"""
         if self.weather_provider == 'openweathermap':
-            geo = await self._geocode_city(city)
-            if not geo:
-                return None
-
-            url = f"{self.openweathermap_base_url}/weather"
-            params = {
-                'lat': geo['lat'],
-                'lon': geo['lon'],
-                'appid': self.weather_api_key,
-                'units': 'metric',
-                'lang': 'zh_cn'
-            }
-
-            try:
-                loop = asyncio.get_running_loop()
-                resp = await loop.run_in_executor(None, lambda: self._requests_session.get(url, params=params, timeout=15))
-                if resp.status_code == 200:
-                    result = resp.json()
-                    result['name'] = city
-                    return result
-                print(f"Weather API error: {resp.status_code} - {resp.text}")
-                return None
-            except Exception as e:
-                print(f"Weather API call failed: {e}")
-                return None
+            return await self._get_openweathermap_data(city)
+        elif self.weather_provider == 'juhe':
+            return await self._get_juhe_weather_data(city)
         else:
             return None
     
@@ -142,9 +271,15 @@ class APIClient:
             print(f"AI keyword expansion failed: {e}")
         return []
 
-    async def get_news_data(self, interests: List[str], random_mode: bool = False) -> Optional[List[Dict]]:
+    async def _get_newsapi_data(self, interests: List[str], random_mode: bool = False) -> Optional[List[Dict]]:
+        # 检查缓存
+        cache_key = self._get_cache_key('news', interests=interests, random_mode=random_mode)
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
         if not self.news_api_key:
-            raise ValueError("NewsAPI key not configured")
+            return None
 
         if random_mode:
             interests = ['technology', 'science', 'startup', 'future', 'innovation']
@@ -185,13 +320,102 @@ class APIClient:
         
         try:
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(None, lambda: self._requests_session.get(url, params=params, timeout=60))
+            response = await loop.run_in_executor(None, lambda: self._requests_session.get(url, params=params, timeout=self.timeout * 2))  # 新闻API可能需要更长时间
             if response.status_code == 200:
                 result = response.json()
-                return result.get('articles', [])
+                articles = result.get('articles', [])
+                # 保存到缓存（60分钟）
+                self._save_to_cache(cache_key, articles, expire_minutes=60)
+                return articles
             else:
                 print(f"NewsAPI error: {response.status_code} - {response.text}")
                 return None
         except Exception as e:
             print(f"NewsAPI call failed: {e}")
             return None
+    
+    async def _get_juhe_news_data(self, news_type: str = 'top') -> Optional[List[Dict]]:
+        # 检查缓存
+        cache_key = self._get_cache_key('news', interests=[], random_mode=False)
+        cached_data = self._get_from_cache(cache_key)
+        if cached_data:
+            return cached_data
+        
+        if not self.juhe_news_api_key:
+            return None
+        
+        url = f"{self.juhe_news_base_url}?key={self.juhe_news_api_key}&type={news_type}&page_size=30"
+        
+        try:
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(None, lambda: self._requests_session.get(url, timeout=self.timeout))
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('error_code') == 0:
+                    data = result.get('result', {}).get('data', [])
+                    # 保存到缓存（60分钟）
+                    self._save_to_cache(cache_key, data, expire_minutes=60)
+                    return data
+            return None
+        except Exception as e:
+            print(f"Juhe News API call failed: {e}")
+            return None
+
+    async def get_news_data(self, interests: List[str], random_mode: bool = False) -> Optional[List[Dict]]:
+        """获取新闻数据 - 支持多提供商"""
+        if self.news_provider == 'newsapi':
+            return await self._get_newsapi_data(interests, random_mode)
+        elif self.news_provider == 'juhe':
+            return await self._get_juhe_news_data('top')  # juhe不支持兴趣过滤，使用推荐
+        else:
+            return None
+    
+    async def check_weather_provider_health(self) -> bool:
+        """检查天气提供商健康状态"""
+        try:
+            if self.weather_provider == 'openweathermap':
+                # 检查OpenWeatherMap API密钥有效性
+                test_city = "London"
+                geo_url = "http://api.openweathermap.org/geo/1.0/direct"
+                params = {'q': test_city, 'limit': 1, 'appid': self.weather_api_key}
+                resp = requests.get(geo_url, params=params, timeout=self.timeout)
+                return resp.status_code == 200 and len(resp.json()) > 0
+            
+            elif self.weather_provider == 'juhe':
+                # 检查聚合数据天气API密钥有效性
+                test_city = "北京"
+                import urllib.parse
+                encoded_city = urllib.parse.quote(test_city, encoding='utf-8')
+                url = f"{self.juhe_weather_base_url}?key={self.juhe_weather_api_key}&city={encoded_city}"
+                resp = requests.get(url, timeout=self.timeout)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    return result.get('error_code') == 0
+                return False
+            
+            return False
+        except Exception:
+            return False
+    
+    async def check_news_provider_health(self) -> bool:
+        """检查新闻提供商健康状态"""
+        try:
+            if self.news_provider == 'newsapi':
+                # 检查NewsAPI密钥有效性
+                url = f"{self.newsapi_base_url}/top-headlines"
+                params = {'country': 'us', 'apiKey': self.news_api_key, 'pageSize': 1}
+                resp = requests.get(url, params=params, timeout=self.timeout)
+                return resp.status_code == 200
+            
+            elif self.news_provider == 'juhe':
+                # 检查聚合数据新闻API密钥有效性
+                url = f"{self.juhe_news_base_url}?key={self.juhe_news_api_key}&type=top&page_size=1"
+                resp = requests.get(url, timeout=self.timeout)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    return result.get('error_code') == 0
+                return False
+            
+            return False
+        except Exception:
+            return False

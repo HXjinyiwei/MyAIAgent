@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import time
 from .utils.config import ConfigManager
 from .memory import MemoryManager
 from .utils.api_client import APIClient
@@ -15,11 +16,67 @@ class AgentCore:
         self.memory_manager = MemoryManager()
         self.api_client = APIClient()
         self.tools = {}  # 工具注册表
+        self._weather_health_checked = False
+        self._news_health_checked = False
+        self._last_health_check = 0
+        self.max_retries = 3  # 最大重试次数
+        self.retry_delay = 1  # 重试延迟（秒）
     
     def register_tool(self, name: str, tool_func):
         """注册工具函数"""
         self.tools[name] = tool_func
     
+    async def _execute_tool_with_retry(self, tool_name: str, params: Dict, max_retries: int = None) -> Optional[str]:
+        """带重试机制的工具执行"""
+        if max_retries is None:
+            max_retries = self.max_retries
+        
+        last_exception = None
+        for attempt in range(max_retries + 1):
+            try:
+                if tool_name in self.tools:
+                    result = await self.tools[tool_name](**params)
+                    if result is not None:
+                        return result
+                    # 如果结果为None，也视为失败，进行重试
+            except Exception as e:
+                last_exception = e
+                print(f"Tool {tool_name} attempt {attempt + 1} failed: {e}")
+            
+            if attempt < max_retries:
+                await asyncio.sleep(self.retry_delay * (2 ** attempt))  # 指数退避
+        
+        print(f"Tool {tool_name} failed after {max_retries + 1} attempts: {last_exception}")
+        return None
+    
+    async def _execute_tool(self, tool_name: str, params: Dict) -> Optional[str]:
+        """执行指定工具 - 使用重试机制"""
+        return await self._execute_tool_with_retry(tool_name, params)
+
+    async def _check_api_health(self):
+        """检查API健康状态（每5分钟检查一次）"""
+        current_time = time.time()
+        if current_time - self._last_health_check < 300:  # 5分钟
+            return
+        
+        self._last_health_check = current_time
+        
+        # 并行检查天气和新闻API健康状态
+        weather_task = self.api_client.check_weather_provider_health()
+        news_task = self.api_client.check_news_provider_health()
+        
+        weather_healthy, news_healthy = await asyncio.gather(
+            weather_task, news_task, return_exceptions=True
+        )
+        
+        self._weather_health_checked = weather_healthy is True
+        self._news_health_checked = news_healthy is True
+        
+        if not self._weather_health_checked:
+            print("Warning: Weather API health check failed")
+        if not self._news_health_checked:
+            print("Warning: News API health check failed")
+
     async def recognize_intent(self, user_input: str) -> Dict[str, Any]:
         """
         使用DeepSeek API进行意图识别
@@ -110,20 +167,52 @@ class AgentCore:
             return None
     
     async def generate_briefing(self, user_input: str = "") -> str:
-        """生成每日简报"""
+        """生成每日简报 - 支持真正的异步并发执行"""
         # 获取用户配置
         user_config = self.config_manager.get_user_config()
         
-        # 并行执行各模块任务
-        tasks = []
+        # 记录用户交互习惯
+        self.memory_manager.log_user_habit('briefing_generation', {
+            'user_input': user_input,
+            'city': user_config.get('city'),
+            'interests': user_config.get('interests', []),
+            'has_schedule': True  # 实际值会在后面确定
+        })
         
-        # 天气模块
-        weather_result = None
+        # 记录时间段偏好
+        now = datetime.now()
+        hour = now.hour
+        if 6 <= hour < 12:
+            time_period = 'morning'
+        elif 12 <= hour < 18:
+            time_period = 'afternoon'
+        elif 18 <= hour < 24:
+            time_period = 'evening'
+        else:
+            time_period = 'night'
+            
+        # 记录用户查看的内容偏好
         if user_config.get('city'):
-            weather_result = await self._execute_tool('weather', {'city': user_config['city']})
+            self.memory_manager.update_time_preference(time_period, 'weather')
+        if user_config.get('interests'):
+            self.memory_manager.update_time_preference(time_period, 'news')
+        if user_config.get('features', {}).get('quote', True):
+            self.memory_manager.update_time_preference(time_period, 'quote')
         
-        # 新闻模块  
-        news_result = None
+        # 准备并行任务列表
+        tasks = []
+        task_names = []
+        
+        # 天气模块任务
+        if user_config.get('city'):
+            weather_task = self._execute_tool('weather', {'city': user_config['city']})
+            tasks.append(weather_task)
+            task_names.append('weather')
+        else:
+            tasks.append(None)
+            task_names.append('weather')
+        
+        # 新闻模块任务
         is_random = '随机' in user_input if user_input else False
         all_interests = user_config.get('interests', [])
         disabled_today = user_config.get('disabled_today', [])
@@ -131,26 +220,65 @@ class AgentCore:
         if disabled_today:
             user_config['disabled_today'] = []
             self.config_manager.update_user_config(user_config)
+        
         if is_random or active_interests:
-            news_result = await self._execute_tool('news', {
+            news_task = self._execute_tool('news', {
                 'interests': active_interests if not is_random else all_interests,
                 'random_mode': is_random
             })
+            tasks.append(news_task)
+            task_names.append('news')
+        else:
+            tasks.append(None)
+            task_names.append('news')
         
-        # 日程模块
-        schedule_result = await self._execute_tool('calendar', {})
+        # 日程模块任务（总是执行）
+        calendar_task = self._execute_tool('calendar', {})
+        tasks.append(calendar_task)
+        task_names.append('calendar')
         
-        # 寄语模块
-        quote_result = None
+        # 寄语模块任务
         if user_config.get('features', {}).get('quote', True):
             is_weekend = datetime.now().weekday() >= 5
-            quote_result = await self._execute_tool('quote', {
+            quote_task = self._execute_tool('quote', {
                 'profession': user_config.get('profession', ''),
-                'has_schedule': bool(schedule_result and '未录入' not in schedule_result),
+                'has_schedule': True,  # 这个参数在实际调用时会被忽略，因为日程结果还未知
                 'is_weekend': is_weekend
             })
+            tasks.append(quote_task)
+            task_names.append('quote')
+        else:
+            tasks.append(None)
+            task_names.append('quote')
         
-        # 生成智能关联提醒
+        # 并行执行所有任务
+        actual_tasks = [task for task in tasks if task is not None]
+        if actual_tasks:
+            results = await asyncio.gather(*actual_tasks, return_exceptions=True)
+        else:
+            results = []
+        
+        # 处理结果
+        result_dict = {}
+        result_index = 0
+        for i, task_name in enumerate(task_names):
+            if tasks[i] is not None:
+                result = results[result_index]
+                result_index += 1
+                if isinstance(result, Exception):
+                    print(f"Task {task_name} failed: {result}")
+                    result_dict[task_name] = None
+                else:
+                    result_dict[task_name] = result
+            else:
+                result_dict[task_name] = None
+        
+        weather_result = result_dict.get('weather')
+        news_result = result_dict.get('news')
+        schedule_result = result_dict.get('calendar')
+        quote_result = result_dict.get('quote')
+        
+        # 生成智能关联提醒（需要天气和日程结果）
         intelligent_reminder = None
         if weather_result and schedule_result:
             intelligent_reminder = await self.generate_intelligent_reminder(weather_result, schedule_result)
@@ -191,6 +319,12 @@ class AgentCore:
             insight = self._generate_preference_insight(user_config, preferences)
             if insight:
                 briefing_parts.append(insight)
+            
+            # 新增：记忆分析洞察
+            user_patterns = self.memory_manager.analyze_user_patterns()
+            pattern_insight = self._generate_pattern_insight(user_patterns)
+            if pattern_insight:
+                briefing_parts.append(pattern_insight)
         
         if not briefing_parts:
             now = datetime.now()
@@ -271,6 +405,28 @@ class AgentCore:
 
         return "> ℹ️ **偏好洞察**：" + " ".join(suggestions)
 
+    def _generate_pattern_insight(self, user_patterns: Dict) -> Optional[str]:
+        """生成用户模式洞察"""
+        insights = []
+        
+        # 活跃时间段洞察
+        if user_patterns['active_periods']:
+            top_period = user_patterns['active_periods'][0]
+            period_names = {'morning': '早晨', 'afternoon': '下午', 'evening': '晚上', 'night': '深夜'}
+            period_name = period_names.get(top_period['period'], top_period['period'])
+            insights.append(f"你最常在{period_name}使用简报服务。")
+        
+        # 功能使用洞察
+        if user_patterns['top_interactions']:
+            top_interaction = user_patterns['top_interactions'][0]
+            interaction_names = {'briefing_generation': '生成简报', 'config_modification': '配置修改'}
+            interaction_name = interaction_names.get(top_interaction['type'], top_interaction['type'])
+            insights.append(f"你最常用的功能是{interaction_name}。")
+        
+        if insights:
+            return "> ℹ️ **使用洞察**：" + " ".join(insights)
+        return None
+
     def _record_briefing_memory(self, interests: List[str]):
         for interest in interests:
             self.memory_manager.update_preference(interest, increment=1)
@@ -279,16 +435,6 @@ class AgentCore:
         """获取当前日期字符串"""
         from datetime import datetime
         return datetime.now().strftime("%Y年%m月%d日 %A")
-    
-    async def _execute_tool(self, tool_name: str, params: Dict) -> Optional[str]:
-        """执行指定工具"""
-        if tool_name in self.tools:
-            try:
-                return await self.tools[tool_name](**params)
-            except Exception as e:
-                print(f"Tool {tool_name} failed: {e}")
-                return None
-        return None
     
     async def handle_config_modification(self, user_input: str) -> str:
         user_config = self.config_manager.get_user_config()
@@ -396,6 +542,22 @@ class AgentCore:
                     if weather_tool:
                         result = await weather_tool(city_names[0])
                         return result
+
+            # 新增：检测简单天气查询（如"广州天气"）
+            elif '天气' in user_input and len(user_input.strip()) <= 8:
+                # 简短的天气查询，尝试提取城市
+                cleaned = re.sub(r'天气', ' ', user_input)
+                found = re.findall(r'[\u4e00-\u9fff]{2,3}', cleaned)
+                if found:
+                    weather_tool = self.tools.get('weather')
+                    if weather_tool:
+                        result = await weather_tool(found[0])
+                        return result
+
+            # 新增：配置查询规则匹配
+            config_query_keywords = ['我的配置', '当前配置', '个人信息', '个人设置', '有哪些设置', '看看配置', '配置情况']
+            if any(kw in user_input for kw in config_query_keywords):
+                return await self.handle_config_modification(user_input)
 
             # 检测日程查询/管理
             schedule_kw = ['日程', '安排', '会议', '学习', '面试', '开会', '评审', '事件', '事项', '取消', '修改日程', '同步', '周会', '例会', '培训', '哪些事', '什么事', '有事', '有个会', '有个事', '议程', '会要开']

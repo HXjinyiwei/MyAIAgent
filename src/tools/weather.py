@@ -1,13 +1,167 @@
 import asyncio
-from typing import Dict, Optional, Tuple, List
-from datetime import datetime
+from typing import Dict, Optional, List, Protocol
 from ..utils.api_client import APIClient
 
-async def get_weather_data(city: str) -> Optional[Dict]:
-    api_client = APIClient()
-    return await api_client.get_weather_data(city)
+class BaseWeatherProvider(Protocol):
+    """天气提供商抽象基类"""
+    
+    async def get_weather_data(self, city: str) -> Optional[Dict]:
+        """获取原始天气数据"""
+        ...
+
+class OpenWeatherMapProvider:
+    """OpenWeatherMap 天气提供商实现"""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.openweathermap.org/data/2.5"
+    
+    async def _geocode_city(self, city: str) -> Optional[Dict]:
+        CITY_COORDS = {
+            '重庆': (29.431586, 106.912251),
+            '北京': (39.9042, 116.4074),
+            '上海': (31.2304, 121.4737),
+            '天津': (39.3434, 117.3616),
+            '成都': (30.5728, 104.0668),
+            '西安': (34.3416, 108.9398),
+            '香港': (22.3193, 114.1694),
+        }
+        if city in CITY_COORDS:
+            return {'lat': CITY_COORDS[city][0], 'lon': CITY_COORDS[city][1], 'name': city}
+
+        geo_url = "http://api.openweathermap.org/geo/1.0/direct"
+        params = {'q': city, 'limit': 1, 'appid': self.api_key}
+        
+        try:
+            import requests
+            resp = requests.get(geo_url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    return {'lat': data[0]['lat'], 'lon': data[0]['lon'], 'name': data[0].get('local_names', {}).get('zh', data[0]['name'])}
+                return None
+            return None
+        except Exception:
+            return None
+    
+    async def get_weather_data(self, city: str) -> Optional[Dict]:
+        geo = await self._geocode_city(city)
+        if not geo:
+            return None
+
+        url = f"{self.base_url}/weather"
+        params = {
+            'lat': geo['lat'],
+            'lon': geo['lon'],
+            'appid': self.api_key,
+            'units': 'metric',
+            'lang': 'zh_cn'
+        }
+
+        try:
+            import requests
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                result = resp.json()
+                result['name'] = city
+                return result
+            return None
+        except Exception:
+            return None
+
+class JuheWeatherProvider:
+    """聚合数据(juhe)天气提供商实现"""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://apis.juhe.cn/simpleWeather/query"
+    
+    async def get_weather_data(self, city: str) -> Optional[Dict]:
+        import urllib.parse
+        import requests
+        
+        # 对城市名进行URL编码
+        encoded_city = urllib.parse.quote(city, encoding='utf-8')
+        url = f"{self.base_url}?key={self.api_key}&city={encoded_city}"
+        
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get('error_code') == 0:
+                    # 转换为标准化格式
+                    juhe_data = result.get('result', {})
+                    if not juhe_data:
+                        return None
+                    
+                    realtime = juhe_data.get('realtime', {})
+                    future = juhe_data.get('future', [])
+                    
+                    # 构建标准化的天气数据结构
+                    standardized_data = {
+                        'name': juhe_data.get('city', city),
+                        'weather': [{'description': realtime.get('info', '未知')}],
+                        'main': {
+                            'temp': float(realtime.get('temperature', 0)) if realtime.get('temperature') else 0,
+                            'feels_like': float(realtime.get('temperature', 0)) if realtime.get('temperature') else 0,
+                            'humidity': int(realtime.get('humidity', 0)) if realtime.get('humidity') else 0,
+                            'pressure': 1013  # juhe不提供气压，使用标准值
+                        },
+                        'wind': {
+                            'speed': 0  # juhe不提供风速，暂时设为0
+                        },
+                        'visibility': 10000,  # juhe不提供能见度，使用默认值
+                        'clouds': {'all': 0}  # juhe不提供云量，设为0
+                    }
+                    
+                    # 如果有未来天气数据，取第一天作为当前温度范围
+                    if future:
+                        day_data = future[0]
+                        temp_str = day_data.get('temperature', '0/0℃')
+                        # 解析温度字符串如 "1/7℃"
+                        if '℃' in temp_str:
+                            temp_parts = temp_str.replace('℃', '').split('/')
+                            if len(temp_parts) == 2:
+                                try:
+                                    temp_min = float(temp_parts[0])
+                                    temp_max = float(temp_parts[1])
+                                    standardized_data['main']['temp_min'] = temp_min
+                                    standardized_data['main']['temp_max'] = temp_max
+                                    # 如果没有实时温度，使用平均温度
+                                    if standardized_data['main']['temp'] == 0:
+                                        standardized_data['main']['temp'] = (temp_min + temp_max) / 2
+                                except ValueError:
+                                    pass
+                    
+                    return standardized_data
+            return None
+        except Exception:
+            return None
+
+def create_weather_provider(provider_name: str, api_key: str) -> Optional[BaseWeatherProvider]:
+    """天气提供商工厂函数"""
+    if provider_name == 'openweathermap':
+        return OpenWeatherMapProvider(api_key)
+    elif provider_name == 'juhe':
+        return JuheWeatherProvider(api_key)
+    else:
+        return None
+
+async def get_weather_data(city: str, weather_provider: str = 'openweathermap', 
+                          weather_api_key: str = None) -> Optional[Dict]:
+    """获取天气数据 - 支持多提供商"""
+    if not weather_api_key:
+        return None
+    
+    provider = create_weather_provider(weather_provider, weather_api_key)
+    if not provider:
+        return None
+    
+    return await provider.get_weather_data(city)
 
 def _extract_weather_data(weather_data: Dict, city_name: str) -> Dict:
+    """保持向后兼容的旧方法，但内部使用新架构"""
+    # 这个方法现在主要用于处理OpenWeatherMap的旧数据格式
     weather_info = weather_data['weather'][0] if weather_data.get('weather') else {}
     main_data = weather_data.get('main', {})
     temp = main_data.get('temp', 0)
@@ -21,7 +175,6 @@ def _extract_weather_data(weather_data: Dict, city_name: str) -> Dict:
         'feels_like': main_data.get('feels_like', 0),
         'humidity': main_data.get('humidity', 0),
         'pressure': main_data.get('pressure', 0),
-        'wind_speed': weather_data.get('wind', {}).get('speed', 0),
         'visibility': weather_data.get('visibility', 0),
         'clouds': weather_data.get('clouds', {}).get('all', 0),
     }
@@ -50,25 +203,27 @@ async def _generate_ai_narrative(d: Dict) -> Optional[str]:
     api_client = APIClient()
     is_extreme = _is_extreme_weather(d['condition_main'])
 
-    prompt = f"""根据以下天气数据，生成一段自然亲切的中文天气简报（不超过150字）。
-
-城市：{d['city_name']}
+    # 构建天气数据描述，不包含风速
+    weather_info = f"""城市：{d['city_name']}
 天气：{d['description']}
 温度：{d['temp']:.0f}°C（范围 {d['temp_min']:.0f}~{d['temp_max']:.0f}°C）
 体感：{d['feels_like']:.0f}°C
 湿度：{d['humidity']}%
-风速：{d['wind_speed']} m/s
-能见度：{d['visibility']}m
+能见度：{d['visibility']}m"""
+
+    prompt = f"""根据以下天气数据，生成一段自然亲切的中文天气简报（不超过150字）。
+
+{weather_info}
 
 要求：
 - 描述今天天气状况、温度区间、体感
-- 给出穿衣建议和出行建议
+- 给出穿衣建议和出行建议  
 - 语气亲切自然
 - {"开头加上⚠️ 极端天气警告，语气要严肃醒目" if is_extreme else ""}
 - 按以下格式输出：
 
 🌡️ 温度：[一句话描述]
-🤗 体感：[一句话描述]
+🤗 体感：[一句话描述]  
 💡 建议：[穿衣+出行建议]"""
 
     messages = [
@@ -125,15 +280,18 @@ def _rule_based_narrative(d: Dict) -> str:
 
     return f"🌡️ 温度 {d['temp_min']:.0f}~{d['temp_max']:.0f}°C，天气{tag}\n🤗 {feels_str}\n💡 建议：{clothing}，{'适合户外活动' if temp > 15 and temp < 30 else '注意适当调整活动'}"
 
-async def process_weather_for_briefing(city: str) -> str:
+async def process_weather_for_briefing(city: str, weather_provider: str = 'openweathermap', 
+                                     weather_api_key: str = None) -> str:
     if not city:
         return "## ☀️ 今日天气\n（未设置城市，暂无法查询天气。对我说\"我在广州\"即可开启天气功能。）"
 
-    weather_data = await get_weather_data(city)
-    if not weather_data:
-        return "## ☀️ 今日天气\n天气服务暂时不可用，请稍后再试。"
-
     try:
+        weather_data = await get_weather_data(city, weather_provider, weather_api_key)
+        if not weather_data:
+            # 增强的优雅降级提示
+            provider_name = "聚合数据" if weather_provider == 'juhe' else "天气服务"
+            return f"## ☀️ 今日天气\n{provider_name}暂时不可用，请稍后再试。"
+        
         d = _extract_weather_data(weather_data, city)
         icon = _get_weather_icon(d['description'])
         is_extreme = _is_extreme_weather(d['condition_main'])
@@ -156,17 +314,23 @@ async def process_weather_for_briefing(city: str) -> str:
 | 🌡️ 温度范围 | {temp_header} |
 | 🤗 体感温度 | {d['feels_like']:.0f}°C |
 | 💧 湿度 | {d['humidity']}% |
-| 🌬️ 风速 | {d['wind_speed']} m/s |
 | 👁️ 能见度 | {d['visibility']}m |"""
 
         return briefing
 
-    except KeyError as e:
+    except (KeyError, TypeError, ValueError) as e:
+        # 数据解析错误 - 使用缓存或默认数据
         print(f"Weather data parsing failed: {e}")
-        return f"## ☀️ 今日天气\n天气数据解析失败：{str(e)}"
+        return f"## ☀️ 今日天气 · {city}\n🌤️ **数据格式异常** | --°C | 💧--%\n\n🌡️ 温度：暂无有效数据\n🤗 体感：暂无有效数据\n💡 建议：天气服务数据异常，请稍后再试。\n\n| 项目 | 数值 |\n| :--- | :--- |\n| 🌡️ 温度范围 | --°C |\n| 🤗 体感温度 | --°C |\n| 💧 湿度 | --% |\n| 👁️ 能见度 | --m |"
+    
+    except Exception as e:
+        # 其他未知错误
+        print(f"Weather service error: {e}")
+        return f"## ☀️ 今日天气\n天气服务遇到技术问题，请稍后再试。"
 
-async def process_weather_comparison(cities: List[str]) -> str:
-    tasks = [get_weather_data(city) for city in cities]
+async def process_weather_comparison(cities: List[str], weather_provider: str = 'openweathermap', 
+                                   weather_api_key: str = None) -> str:
+    tasks = [get_weather_data(city, weather_provider, weather_api_key) for city in cities]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     city_data = {}
@@ -185,10 +349,10 @@ async def process_weather_comparison(cities: List[str]) -> str:
     for city, d in city_data.items():
         icon = _get_weather_icon(d['description'])
         table_rows.append(
-            f"| {icon} {d['city_name']} | {d['temp_min']:.0f}~{d['temp_max']:.0f}°C | {d['description']} | {d['humidity']}% | {d['wind_speed']} m/s |"
+            f"| {icon} {d['city_name']} | {d['temp_min']:.0f}~{d['temp_max']:.0f}°C | {d['description']} | {d['humidity']}% |"
         )
 
-    table = "| 城市 | 温度 | 天气 | 湿度 | 风速 |\n| :--- | :--- | :--- | :--- | :--- |\n" + "\n".join(table_rows)
+    table = "| 城市 | 温度 | 天气 | 湿度 |\n| :--- | :--- | :--- | :--- |\n" + "\n".join(table_rows)
 
     if len(city_data) >= 2:
         d_list = list(city_data.values())
